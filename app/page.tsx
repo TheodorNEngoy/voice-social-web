@@ -9,6 +9,8 @@ type VoicePost = {
   transcript: string;
   audio_url: string | null;
   like_count: number;
+  user_id: string | null;
+  author_name: string | null;
 };
 
 type VoiceReply = {
@@ -17,6 +19,8 @@ type VoiceReply = {
   transcript: string;
   audio_url: string | null;
 };
+
+type FeedMode = "global" | "following";
 
 export default function HomePage() {
   const [userId, setUserId] = useState<string | null>(null);
@@ -33,48 +37,114 @@ export default function HomePage() {
 
   const [feed, setFeed] = useState<VoicePost[]>([]);
   const [isLoadingFeed, setIsLoadingFeed] = useState(true);
+  const [feedMode, setFeedMode] = useState<FeedMode>("global");
 
   const [openRepliesFor, setOpenRepliesFor] = useState<string | null>(null);
   const [replies, setReplies] = useState<Record<string, VoiceReply[]>>({});
-  const [isLoadingRepliesFor, setIsLoadingRepliesFor] = useState<string | null>(null);
+  const [isLoadingRepliesFor, setIsLoadingRepliesFor] = useState<string | null>(
+    null
+  );
   const [isReplyRecording, setIsReplyRecording] = useState(false);
-  const [replyRecordingFor, setReplyRecordingFor] = useState<string | null>(null);
+  const [replyRecordingFor, setReplyRecordingFor] = useState<string | null>(
+    null
+  );
+
+  const [digest, setDigest] = useState<string | null>(null);
+  const [isLoadingDigest, setIsLoadingDigest] = useState(false);
+
+  const [digestAudioUrl, setDigestAudioUrl] = useState<string | null>(null);
+  const [isLoadingDigestAudio, setIsLoadingDigestAudio] = useState(false);
+
+  const [filterUserId, setFilterUserId] = useState<string | null>(null);
+  const [filterUserName, setFilterUserName] = useState<string | null>(null);
+
+  const [followingIds, setFollowingIds] = useState<Set<string>>(new Set());
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<BlobPart[]>([]);
-
   const replyMediaRecorderRef = useRef<MediaRecorder | null>(null);
   const replyChunksRef = useRef<BlobPart[]>([]);
 
-  // Load session and feed on first render
+  // ---------- Init ----------
+
   useEffect(() => {
     const init = async () => {
       try {
         const {
           data: { session },
         } = await browserSupabase.auth.getSession();
+
+        let currentUserId: string | null = null;
+        let currentEmail: string | null = null;
+
         if (session?.user) {
-          setUserId(session.user.id);
-          setUserEmail(session.user.email ?? null);
+          currentUserId = session.user.id;
+          currentEmail = session.user.email ?? null;
+          setUserId(currentUserId);
+          setUserEmail(currentEmail);
+
+          // ensure profile exists
+          await fetch("/api/profile", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ userId: currentUserId, email: currentEmail }),
+          }).catch(() => {});
+
+          await loadFollowingIds(currentUserId);
         }
-        await loadFeed();
+
+        await loadFeed("global");
+        await loadDigest(currentUserId);
       } catch (err) {
         console.error(err);
         setError("Failed to initialize app.");
       }
     };
-    init();
+    void init();
   }, []);
 
-  const loadFeed = async () => {
+  // ---------- Helpers: follow graph & feed & digest ----------
+
+  const loadFollowingIds = async (viewerId: string) => {
+    try {
+      const res = await fetch(
+        `/api/follow?viewerId=${encodeURIComponent(viewerId)}`
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to load follows");
+      }
+      const ids = new Set<string>((data.followingIds || []) as string[]);
+      setFollowingIds(ids);
+    } catch (err) {
+      console.error(err);
+      // ignore in UI; we can retry later
+    }
+  };
+
+  const loadFeed = async (mode: FeedMode) => {
     try {
       setIsLoadingFeed(true);
-      const res = await fetch("/api/feed");
+      setError(null);
+
+      let url = "/api/feed";
+      if (mode === "following") {
+        if (!userId) {
+          setFeed([]);
+          setFeedMode(mode);
+          setIsLoadingFeed(false);
+          return;
+        }
+        url = `/api/feed/following?viewerId=${encodeURIComponent(userId)}`;
+      }
+
+      const res = await fetch(url);
       const data = await res.json();
       if (!res.ok) {
         throw new Error(data.error || "Failed to load feed");
       }
       setFeed(data.posts || []);
+      setFeedMode(mode);
     } catch (err) {
       console.error(err);
       setError("Failed to load feed.");
@@ -83,11 +153,64 @@ export default function HomePage() {
     }
   };
 
-  const refreshFeed = async () => {
-    await loadFeed();
+  const loadDigest = async (viewerId?: string | null) => {
+    try {
+      setIsLoadingDigest(true);
+      const v = viewerId ?? userId;
+      const url = v
+        ? `/api/digest?viewerId=${encodeURIComponent(v)}`
+        : "/api/digest";
+
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Failed to generate digest");
+      }
+      setDigest(data.digest || null);
+    } catch (err) {
+      console.error(err);
+      setDigest(null);
+      setError("Failed to load digest.");
+    } finally {
+      setIsLoadingDigest(false);
+    }
   };
 
-  // Auth handlers
+  const playDigestAudio = async () => {
+    try {
+      setIsLoadingDigestAudio(true);
+      setError(null);
+      const v = userId;
+      const url = v
+        ? `/api/digest-audio?viewerId=${encodeURIComponent(v)}`
+        : "/api/digest-audio";
+
+      const res = await fetch(url);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || "Failed to generate audio digest");
+      }
+      const blob = await res.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      setDigestAudioUrl(audioUrl);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to play AI digest.");
+    } finally {
+      setIsLoadingDigestAudio(false);
+    }
+  };
+
+  const refreshEverything = async () => {
+    await loadFeed(feedMode);
+    await loadDigest();
+    if (userId) {
+      await loadFollowingIds(userId);
+    }
+  };
+
+  // ---------- Auth ----------
+
   const handleSignUp = async () => {
     try {
       setAuthLoading(true);
@@ -98,8 +221,20 @@ export default function HomePage() {
       });
       if (error) throw error;
       if (data.user) {
-        setUserId(data.user.id);
-        setUserEmail(data.user.email ?? null);
+        const id = data.user.id;
+        const email = data.user.email ?? null;
+        setUserId(id);
+        setUserEmail(email);
+
+        await fetch("/api/profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId: id, email }),
+        }).catch(() => {});
+
+        await loadFollowingIds(id);
+        await loadFeed(feedMode);
+        await loadDigest(id);
       }
       setAuthPassword("");
     } catch (err: any) {
@@ -120,8 +255,20 @@ export default function HomePage() {
       });
       if (error) throw error;
       if (data.user) {
-        setUserId(data.user.id);
-        setUserEmail(data.user.email ?? null);
+        const id = data.user.id;
+        const email = data.user.email ?? null;
+        setUserId(id);
+        setUserEmail(email);
+
+        await fetch("/api/profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId: id, email }),
+        }).catch(() => {});
+
+        await loadFollowingIds(id);
+        await loadFeed(feedMode);
+        await loadDigest(id);
       }
       setAuthPassword("");
     } catch (err: any) {
@@ -139,6 +286,9 @@ export default function HomePage() {
       await browserSupabase.auth.signOut();
       setUserId(null);
       setUserEmail(null);
+      setFollowingIds(new Set());
+      await loadFeed("global");
+      await loadDigest(null);
     } catch (err) {
       console.error(err);
       setError("Sign out failed.");
@@ -146,6 +296,8 @@ export default function HomePage() {
       setAuthLoading(false);
     }
   };
+
+  // ---------- Posting ----------
 
   const startRecording = async () => {
     setError(null);
@@ -163,7 +315,9 @@ export default function HomePage() {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: "audio/webm",
+      });
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
 
@@ -179,7 +333,7 @@ export default function HomePage() {
         setAudioUrl(url);
 
         await sendPostToServer(blob);
-        await refreshFeed();
+        await refreshEverything();
       };
 
       mediaRecorder.start();
@@ -251,17 +405,21 @@ export default function HomePage() {
         throw new Error(data.error || "Failed to like post");
       }
 
-      await refreshFeed();
+      await loadFeed(feedMode);
     } catch (err) {
       console.error(err);
       setError("Failed to like post.");
     }
   };
 
+  // ---------- Replies ----------
+
   const fetchReplies = async (postId: string) => {
     try {
       setIsLoadingRepliesFor(postId);
-      const res = await fetch(`/api/replies?postId=${encodeURIComponent(postId)}`);
+      const res = await fetch(
+        `/api/replies?postId=${encodeURIComponent(postId)}`
+      );
       const data = await res.json();
 
       if (!res.ok) {
@@ -305,7 +463,9 @@ export default function HomePage() {
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: "audio/webm",
+      });
       replyMediaRecorderRef.current = mediaRecorder;
       replyChunksRef.current = [];
       setReplyRecordingFor(postId);
@@ -326,7 +486,9 @@ export default function HomePage() {
       setIsReplyRecording(true);
     } catch (err) {
       console.error(err);
-      setError("Could not start reply recording. Check microphone permissions.");
+      setError(
+        "Could not start reply recording. Check microphone permissions."
+      );
     }
   };
 
@@ -344,12 +506,11 @@ export default function HomePage() {
     try {
       setError(null);
 
-      const url =
-        userId
-          ? `/api/reply?postId=${encodeURIComponent(postId)}&userId=${encodeURIComponent(
-              userId
-            )}`
-          : `/api/reply?postId=${encodeURIComponent(postId)}`;
+      const url = userId
+        ? `/api/reply?postId=${encodeURIComponent(
+            postId
+          )}&userId=${encodeURIComponent(userId)}`
+        : `/api/reply?postId=${encodeURIComponent(postId)}`;
 
       const res = await fetch(url, {
         method: "POST",
@@ -370,6 +531,60 @@ export default function HomePage() {
       setError("Failed to save reply.");
     }
   };
+
+  // ---------- Follow / unfollow ----------
+
+  const toggleFollow = async (targetUserId: string | null) => {
+    if (!userId || !targetUserId || userId === targetUserId) return;
+
+    try {
+      setError(null);
+      const isFollowing = followingIds.has(targetUserId);
+
+      if (isFollowing) {
+        const res = await fetch("/api/follow", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            followerId: userId,
+            followedId: targetUserId,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to unfollow");
+
+        const copy = new Set(followingIds);
+        copy.delete(targetUserId);
+        setFollowingIds(copy);
+      } else {
+        const res = await fetch("/api/follow", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            followerId: userId,
+            followedId: targetUserId,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Failed to follow");
+
+        const copy = new Set(followingIds);
+        copy.add(targetUserId);
+        setFollowingIds(copy);
+      }
+    } catch (err) {
+      console.error(err);
+      setError("Failed to update follow state.");
+    }
+  };
+
+  // ---------- Derived feed ----------
+
+  const visibleFeed = filterUserId
+    ? feed.filter((p) => p.user_id === filterUserId)
+    : feed;
+
+  // ---------- UI ----------
 
   return (
     <main className="min-h-screen flex flex-col items-center bg-slate-950 text-slate-50 p-4">
@@ -392,7 +607,9 @@ export default function HomePage() {
           </>
         ) : (
           <>
-            <p className="text-sm text-slate-200">Sign up or sign in to post & reply.</p>
+            <p className="text-sm text-slate-200">
+              Sign up or sign in to post & reply.
+            </p>
             <input
               type="email"
               value={authEmail}
@@ -427,10 +644,46 @@ export default function HomePage() {
         )}
       </div>
 
+      {/* AI Digest */}
+      <div className="border border-slate-700 rounded-xl p-4 w-full max-w-2xl bg-slate-900/80 mb-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-slate-100">
+            AI digest of recent posts
+          </h2>
+          <div className="flex gap-2">
+            <button
+              onClick={() => loadDigest()}
+              className="text-xs border border-slate-500 px-2 py-1 rounded-lg hover:bg-slate-800"
+            >
+              {isLoadingDigest ? "Refreshing…" : "Refresh digest"}
+            </button>
+            <button
+              onClick={playDigestAudio}
+              className="text-xs border border-slate-500 px-2 py-1 rounded-lg hover:bg-slate-800"
+            >
+              {isLoadingDigestAudio ? "Generating audio…" : "Play digest"}
+            </button>
+          </div>
+        </div>
+        {digest ? (
+          <p className="text-sm text-slate-200 whitespace-pre-wrap">{digest}</p>
+        ) : (
+          <p className="text-xs text-slate-400">
+            {isLoadingDigest ? "Generating digest…" : "No digest yet."}
+          </p>
+        )}
+        {digestAudioUrl && (
+          <div className="mt-2">
+            <audio controls src={digestAudioUrl} className="w-full" />
+          </div>
+        )}
+      </div>
+
       {/* Recorder card */}
       <div className="border border-slate-700 rounded-xl p-6 w-full max-w-md space-y-4 bg-slate-900/60 mb-8">
         <p className="text-sm text-slate-300">
-          Tap record, say something, stop, and we&apos;ll store + transcribe it with Supabase + OpenAI.
+          Tap record, say something, stop, and we&apos;ll store + transcribe it
+          with Supabase + OpenAI.
         </p>
 
         <div className="flex gap-4">
@@ -442,28 +695,26 @@ export default function HomePage() {
           </button>
         </div>
 
-        {error && (
-          <p className="text-sm text-red-400">
-            {error}
-          </p>
-        )}
+        {error && <p className="text-sm text-red-400">{error}</p>}
 
         {audioUrl && (
           <div className="space-y-2">
-            <p className="text-sm text-slate-300">Last recording (local preview):</p>
+            <p className="text-sm text-slate-300">
+              Last recording (local preview):
+            </p>
             <audio controls src={audioUrl} className="w-full" />
           </div>
         )}
 
         {isTranscribing && (
-          <p className="text-sm text-slate-300">
-            Uploading + transcribing…
-          </p>
+          <p className="text-sm text-slate-300">Uploading + transcribing…</p>
         )}
 
         {transcript && !isTranscribing && (
           <div className="mt-2 space-y-1">
-            <p className="text-sm text-slate-300">Transcript (saved in DB):</p>
+            <p className="text-sm text-slate-300">
+              Transcript (saved in DB):
+            </p>
             <p className="text-sm text-slate-100 whitespace-pre-wrap">
               {transcript}
             </p>
@@ -471,103 +722,207 @@ export default function HomePage() {
         )}
       </div>
 
-      {/* Feed + replies (unchanged layout) */}
+      {/* Feed + replies */}
       <section className="w-full max-w-2xl">
         <div className="flex items-center justify-between mb-2">
-          <h2 className="text-xl font-semibold">Recent voice posts</h2>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                setFilterUserId(null);
+                setFilterUserName(null);
+                void loadFeed("global");
+              }}
+              className={`text-xs px-3 py-1 rounded-full border ${
+                feedMode === "global"
+                  ? "border-slate-200 bg-slate-100 text-slate-900"
+                  : "border-slate-500 hover:bg-slate-800"
+              }`}
+            >
+              Global
+            </button>
+            <button
+              onClick={() => {
+                setFilterUserId(null);
+                setFilterUserName(null);
+                void loadFeed("following");
+              }}
+              className={`text-xs px-3 py-1 rounded-full border ${
+                feedMode === "following"
+                  ? "border-slate-200 bg-slate-100 text-slate-900"
+                  : "border-slate-500 hover:bg-slate-800"
+              }`}
+              disabled={!userId}
+            >
+              Following
+            </button>
+          </div>
           <button
-            onClick={refreshFeed}
+            onClick={() => void refreshEverything()}
             className="text-sm border border-slate-500 px-3 py-1 rounded-lg hover:bg-slate-800"
           >
             Refresh
           </button>
         </div>
 
-        {isLoadingFeed && <p className="text-sm text-slate-300">Loading feed…</p>}
+        <div className="flex items-center justify-between mb-2">
+          <div className="space-y-1">
+            <h2 className="text-xl font-semibold">
+              {filterUserName
+                ? `Posts by ${filterUserName}`
+                : feedMode === "following"
+                ? "Following feed"
+                : "Recent voice posts"}
+            </h2>
+            {filterUserId && (
+              <button
+                onClick={() => {
+                  setFilterUserId(null);
+                  setFilterUserName(null);
+                }}
+                className="text-xs border border-slate-500 px-2 py-1 rounded-lg hover:bg-slate-800"
+              >
+                Clear user filter
+              </button>
+            )}
+          </div>
+        </div>
 
-        {!isLoadingFeed && feed.length === 0 && (
-          <p className="text-sm text-slate-400">No posts yet. Record something!</p>
+        {isLoadingFeed && (
+          <p className="text-sm text-slate-300">Loading feed…</p>
+        )}
+
+        {!isLoadingFeed && visibleFeed.length === 0 && (
+          <p className="text-sm text-slate-400">
+            {feedMode === "following"
+              ? "No posts from people you follow yet."
+              : "No posts yet. Record something!"}
+          </p>
         )}
 
         <div className="space-y-4 mt-3">
-          {feed.map((post) => (
-            <article
-              key={post.id}
-              className="border border-slate-800 rounded-lg p-4 bg-slate-900/70 space-y-2"
-            >
-              <p className="text-xs text-slate-400">
-                {new Date(post.created_at).toLocaleString()}
-              </p>
+          {visibleFeed.map((post) => {
+            const isMe = userId && post.user_id === userId;
+            const canFollow = userId && post.user_id && !isMe;
+            const isFollowing =
+              !!post.user_id && followingIds.has(post.user_id);
 
-              {post.audio_url && (
-                <audio controls src={post.audio_url} className="w-full" />
-              )}
-
-              <p className="text-sm text-slate-100 whitespace-pre-wrap">
-                {post.transcript}
-              </p>
-
-              <div className="flex items-center gap-2 mt-1">
-                <button
-                  onClick={() => handleLike(post.id)}
-                  className="text-xs border border-slate-600 rounded-full px-3 py-1 hover:bg-slate-800"
-                >
-                  ♥ Like
-                </button>
-                <span className="text-xs text-slate-300">
-                  {post.like_count} {post.like_count === 1 ? "like" : "likes"}
-                </span>
-              </div>
-
-              <div className="flex items-center gap-2 mt-2">
-                <button
-                  onClick={() =>
-                    isReplyRecording && replyRecordingFor === post.id
-                      ? stopReplyRecording()
-                      : startReplyRecording(post.id)
-                  }
-                  className="text-xs border border-slate-600 rounded-full px-3 py-1 hover:bg-slate-800"
-                >
-                  {isReplyRecording && replyRecordingFor === post.id
-                    ? "■ Stop reply"
-                    : "🎤 Reply"}
-                </button>
-                <button
-                  onClick={() => toggleReplies(post.id)}
-                  className="text-xs border border-slate-600 rounded-full px-3 py-1 hover:bg-slate-800"
-                >
-                  {openRepliesFor === post.id ? "Hide replies" : "Show replies"}
-                </button>
-              </div>
-
-              {openRepliesFor === post.id && (
-                <div className="mt-2 pl-3 border-l border-slate-700 space-y-2">
-                  {isLoadingRepliesFor === post.id && (
-                    <p className="text-xs text-slate-400">Loading replies…</p>
+            return (
+              <article
+                key={post.id}
+                className="border border-slate-800 rounded-lg p-4 bg-slate-900/70 space-y-2"
+              >
+                <p className="text-xs text-slate-400">
+                  {new Date(post.created_at).toLocaleString()}
+                </p>
+                <div className="flex items-center justify-between">
+                  <p className="text-xs text-slate-300">
+                    by{" "}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFilterUserId(post.user_id || null);
+                        setFilterUserName(post.author_name || "Someone");
+                      }}
+                      className="underline underline-offset-2 hover:text-slate-100"
+                    >
+                      {post.author_name || "Someone"}
+                    </button>
+                  </p>
+                  {canFollow && (
+                    <button
+                      onClick={() => toggleFollow(post.user_id!)}
+                      className={`text-[10px] px-2 py-1 rounded-full border ${
+                        isFollowing
+                          ? "border-slate-400 bg-slate-800 text-slate-100"
+                          : "border-slate-500 hover:bg-slate-800"
+                      }`}
+                    >
+                      {isFollowing ? "Following" : "Follow"}
+                    </button>
                   )}
+                </div>
 
-                  {(replies[post.id] ?? []).length === 0 &&
-                    isLoadingRepliesFor !== post.id && (
-                      <p className="text-xs text-slate-500">No replies yet.</p>
+                {post.audio_url && (
+                  <audio controls src={post.audio_url} className="w-full" />
+                )}
+
+                <p className="text-sm text-slate-100 whitespace-pre-wrap">
+                  {post.transcript}
+                </p>
+
+                <div className="flex items-center gap-2 mt-1">
+                  <button
+                    onClick={() => handleLike(post.id)}
+                    className="text-xs border border-slate-600 rounded-full px-3 py-1 hover:bg-slate-800"
+                  >
+                    ♥ Like
+                  </button>
+                  <span className="text-xs text-slate-300">
+                    {post.like_count}{" "}
+                    {post.like_count === 1 ? "like" : "likes"}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2 mt-2">
+                  <button
+                    onClick={() =>
+                      isReplyRecording && replyRecordingFor === post.id
+                        ? stopReplyRecording()
+                        : startReplyRecording(post.id)
+                    }
+                    className="text-xs border border-slate-600 rounded-full px-3 py-1 hover:bg-slate-800"
+                  >
+                    {isReplyRecording && replyRecordingFor === post.id
+                      ? "■ Stop reply"
+                      : "🎤 Reply"}
+                  </button>
+                  <button
+                    onClick={() => toggleReplies(post.id)}
+                    className="text-xs border border-slate-600 rounded-full px-3 py-1 hover:bg-slate-800"
+                  >
+                    {openRepliesFor === post.id
+                      ? "Hide replies"
+                      : "Show replies"}
+                  </button>
+                </div>
+
+                {openRepliesFor === post.id && (
+                  <div className="mt-2 pl-3 border-l border-slate-700 space-y-2">
+                    {isLoadingRepliesFor === post.id && (
+                      <p className="text-xs text-slate-400">
+                        Loading replies…
+                      </p>
                     )}
 
-                  {(replies[post.id] ?? []).map((reply) => (
-                    <div key={reply.id} className="space-y-1">
-                      <p className="text-[11px] text-slate-500">
-                        {new Date(reply.created_at).toLocaleString()}
-                      </p>
-                      {reply.audio_url && (
-                        <audio controls src={reply.audio_url} className="w-full" />
+                    {(replies[post.id] ?? []).length === 0 &&
+                      isLoadingRepliesFor !== post.id && (
+                        <p className="text-xs text-slate-500">
+                          No replies yet.
+                        </p>
                       )}
-                      <p className="text-xs text-slate-100 whitespace-pre-wrap">
-                        {reply.transcript}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </article>
-          ))}
+
+                    {(replies[post.id] ?? []).map((reply) => (
+                      <div key={reply.id} className="space-y-1">
+                        <p className="text-[11px] text-slate-500">
+                          {new Date(reply.created_at).toLocaleString()}
+                        </p>
+                        {reply.audio_url && (
+                          <audio
+                            controls
+                            src={reply.audio_url}
+                            className="w-full"
+                          />
+                        )}
+                        <p className="text-xs text-slate-100 whitespace-pre-wrap">
+                          {reply.transcript}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </article>
+            );
+          })}
         </div>
       </section>
     </main>
